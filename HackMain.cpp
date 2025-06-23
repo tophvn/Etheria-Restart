@@ -37,6 +37,13 @@ uintptr_t GLocalPlayerController = 0;
 uintptr_t GLocalPlayerPawn = 0;
 uintptr_t GLocalPlayerMovementComponent = 0;
 
+// Handle to our own DLL module
+static HMODULE g_hModule = NULL;
+
+// Map để lưu tên từ FNames.txt
+static std::unordered_map<int32_t, std::string> g_nameMap;
+static bool g_nameMapLoaded = false;
+
 // Trạng thái hook và UI
 static ID3D11Device* g_pd3dDevice = NULL;
 static ID3D11DeviceContext* g_pd3dDeviceContext = NULL;
@@ -69,6 +76,7 @@ EndScene oEndScene = nullptr;
 // Forward declaration cho các hàm
 void ApplyWorldHacks();
 void DrawESP();
+void LoadFNamesMap();
 LRESULT CALLBACK hkWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -388,6 +396,10 @@ void DrawESP() {
                      pos = (float*)(rootComp + 0x11c);
                 }
 
+                // Lấy name index và tên của actor
+                int32_t nameIndex = GetNameIndex_Safe(actorAddr);
+                std::string actorName = GetNameByIndex_Safe(nameIndex);
+
                 // Cập nhật vị trí player local (nếu có)
                 if (pos) {
                     // Giả sử player có vị trí khác 0,0,0
@@ -407,12 +419,12 @@ void DrawESP() {
                     distance = sqrt(dx * dx + dy * dy + dz * dz) / 100.0f;
                 }
 
-                char buf[256];
+                char buf[512];
                 if (pos) {
-                    sprintf_s(buf, "[%d] Actor 0x%p (%.1fm) - Pos: %.1f, %.1f, %.1f", 
-                             i, (void*)actorAddr, distance, pos[0], pos[1], pos[2]);
+                    sprintf_s(buf, "[%d] %s (%.1fm) - Pos: %.1f, %.1f, %.1f", 
+                             i, actorName.c_str(), distance, pos[0], pos[1], pos[2]);
                 } else {
-                    sprintf_s(buf, "[%d] Actor 0x%p (No Position)", i, (void*)actorAddr);
+                    sprintf_s(buf, "[%d] %s (No Position)", i, actorName.c_str());
                 }
 
                 ImGui::Text("%s", buf);
@@ -662,6 +674,9 @@ DWORD WINAPI MainThread(LPVOID lpReserved)
 {
     HMODULE hModule = (HMODULE)lpReserved;
     
+    // Load FNames map khi khởi tạo
+    LoadFNamesMap();
+    
     CreateThread(nullptr, 0, FinderThread, nullptr, 0, nullptr);
 
     if (MH_Initialize() != MH_OK)
@@ -747,6 +762,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
+        g_hModule = hModule; // Store module handle
         DisableThreadLibraryCalls(hModule);
         CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
     }
@@ -756,7 +772,79 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 // Thêm lại hàm GetNameByIndex_Safe
 std::string GetNameByIndex_Safe(int32_t nameIndex) {
     if (nameIndex < 0) return "InvalidIndex";
+    
+    // Đảm bảo đã load FNames map
+    if (!g_nameMapLoaded) {
+        LoadFNamesMap();
+    }
+    
+    // Tra cứu trong map
+    auto it = g_nameMap.find(nameIndex);
+    if (it != g_nameMap.end()) {
+        return it->second;
+    }
+    
+    // Nếu không tìm thấy, trả về index
     char buffer[128];
     sprintf_s(buffer, "NameIndex_%d", nameIndex);
     return std::string(buffer);
+}
+
+void LoadFNamesMap() {
+    if (g_nameMapLoaded) return; // Đã load rồi thì không load nữa
+    
+    char modulePath[MAX_PATH];
+    if (g_hModule == NULL || GetModuleFileNameA(g_hModule, modulePath, MAX_PATH) == 0) {
+        return; // Không lấy được đường dẫn DLL
+    }
+
+    std::string dllPath = modulePath;
+    std::string fnamesPath;
+    size_t lastSlash = dllPath.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        fnamesPath = dllPath.substr(0, lastSlash + 1) + "FNames.txt";
+    } else {
+        return; // Đường dẫn không hợp lệ
+    }
+    
+    std::ifstream file(fnamesPath);
+    if (!file.is_open()) {
+        return; // Không mở được file thì thôi
+    }
+    
+    std::string line;
+    // Bỏ qua các dòng trống hoặc dòng header
+    while (std::getline(file, line) && (line.empty() || line[0] != '[')) {
+        // Bỏ qua
+    }
+    
+    // Xử lý dòng đầu tiên (nếu có)
+    if (!line.empty() && line[0] == '[') {
+        size_t endBracket = line.find(']');
+        if (endBracket != std::string::npos && endBracket > 1) {
+            std::string indexStr = line.substr(1, endBracket - 1);
+            std::string name = line.substr(endBracket + 2);
+            try {
+                g_nameMap[std::stoi(indexStr)] = name;
+            } catch (...) {}
+        }
+    }
+
+    // Xử lý các dòng còn lại
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] != '[') continue;
+        
+        size_t endBracket = line.find(']');
+        if (endBracket != std::string::npos && endBracket > 1) {
+            std::string indexStr = line.substr(1, endBracket - 1);
+            std::string name = line.substr(endBracket + 2);
+            
+            try {
+                g_nameMap[std::stoi(indexStr)] = name;
+            } catch (...) {}
+        }
+    }
+    
+    file.close();
+    g_nameMapLoaded = true;
 } 
